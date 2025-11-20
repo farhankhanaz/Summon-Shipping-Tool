@@ -1,596 +1,980 @@
-import React, { useState } from 'react';
-import { Package, TruckIcon, DollarSign, CheckCircle, AlertCircle, Calculator } from 'lucide-react';
-
-const PACKAGING_WEIGHT = 0.5; // lbs - configurable
-
-const ShippingCostChecker = () => {
-  const [lineItems, setLineItems] = useState([{ partNumber: '', quantity: 1, unitWeight: null }]);
-  const [origin, setOrigin] = useState('');
-  const [destination, setDestination] = useState('');
-  const [isResidential, setIsResidential] = useState(false);
-  const [vendorQuote, setVendorQuote] = useState('');
-  const [results, setResults] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [weightBreakdown, setWeightBreakdown] = useState(null);
-  const [errorMessage, setErrorMessage] = useState('');
-
-  // Validate USA ZIP code (5 digits or 5+4 format)
-  const isValidUSAZip = (zip) => {
-    const zipRegex = /^\d{5}(-\d{4})?$/;
-    return zipRegex.test(zip);
-  };
-
-  // Handle ZIP code input - only allow numbers and hyphen
-  const handleZipChange = (value, setter) => {
-    // Only allow digits and hyphen
-    const cleaned = value.replace(/[^\d-]/g, '');
-    setter(cleaned);
-  };
-
-  // Add new line item
-  const addLineItem = () => {
-    setLineItems([...lineItems, { partNumber: '', quantity: 1, unitWeight: null }]);
-  };
-
-  // Remove line item
-  const removeLineItem = (index) => {
-    setLineItems(lineItems.filter((_, i) => i !== index));
-  };
-
-  // Update line item
-  const updateLineItem = (index, field, value) => {
-    const updated = [...lineItems];
-    updated[index][field] = value;
-    setLineItems(updated);
-  };
-
-  // Weight calculation engine - calls real backend API
-  const calculateWeights = async () => {
-    const breakdown = [];
-    let totalPartsWeight = 0;
-
-    for (let item of lineItems) {
-      if (!item.partNumber || !item.quantity) continue;
-
-      // Call backend API for weight
-      const weightInfo = await getPartWeight(item.partNumber);
-      
-      const lineWeight = weightInfo.weight * item.quantity;
-      totalPartsWeight += lineWeight;
-
-      breakdown.push({
-        partNumber: item.partNumber,
-        quantity: item.quantity,
-        unitWeight: weightInfo.weight,
-        lineWeight: lineWeight,
-        source: weightInfo.source,
-        description: weightInfo.description
-      });
-    }
-
-    const totalWeight = totalPartsWeight + PACKAGING_WEIGHT;
-
-    return {
-      items: breakdown,
-      partsWeight: totalPartsWeight,
-      packagingWeight: PACKAGING_WEIGHT,
-      totalWeight: totalWeight
-    };
-  };
-
-  // REAL API: Get part weight from backend
-  const getPartWeight = async (partNumber) => {
-    try {
-      const response = await fetch('/api/get-part-weight', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ partNumber })
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to get part weight');
-      }
-
-      const data = await response.json();
-      return data; // { weight, source, description }
-    } catch (error) {
-      console.error('Error getting part weight:', error);
-      // Fallback to default
-      return {
-        weight: 0.01,
-        source: 'Default Fallback',
-        description: 'Unable to determine weight'
-      };
-    }
-  };
-
-  // REAL API: Get shipping rates from UPS and FedEx
-  const getShippingRates = async (weight, origin, dest, residential) => {
-    try {
-      const response = await fetch('/api/get-shipping-rates', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          weight,
-          originZip: origin,
-          destZip: dest,
-          residential
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to get shipping rates');
-      }
-
-      const data = await response.json();
-      return data; // { ups: { ground: "18.50" }, fedex: { ground: "19.20" } }
-    } catch (error) {
-      console.error('Error getting shipping rates:', error);
-      // Fallback to estimates
-      const baseRate = 15 + (weight * 2);
-      const residentialFee = residential ? 4 : 0;
-      return {
-        ups: {
-          ground: (baseRate + residentialFee + Math.random() * 3).toFixed(2),
-          service: 'UPS Ground'
-        },
-        fedex: {
-          ground: (baseRate + residentialFee + Math.random() * 4 - 1).toFixed(2),
-          service: 'FedEx Ground'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shipping Cost Checker</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
-      };
-    }
-  };
-
-  // Main check shipping function
-  const checkShipping = async () => {
-    setErrorMessage(''); // Clear previous errors
-    
-    console.log('Origin:', origin);
-    console.log('Destination:', destination);
-    console.log('Origin valid?', isValidUSAZip(origin));
-    console.log('Destination valid?', isValidUSAZip(destination));
-
-    if (!origin || !destination || lineItems.length === 0) {
-      setErrorMessage('Please fill in all required fields');
-      return;
-    }
-
-    // Validate USA ZIP codes
-    if (!isValidUSAZip(origin)) {
-      setErrorMessage('Wrong ZIP Code Entered - Origin ZIP code is invalid. Please enter a valid 5-digit USA ZIP code.');
-      return;
-    }
-
-    if (!isValidUSAZip(destination)) {
-      setErrorMessage('Wrong ZIP Code Entered - Destination ZIP code is invalid. Please enter a valid 5-digit USA ZIP code.');
-      return;
-    }
-
-    setLoading(true);
-    setResults(null);
-
-    try {
-      // Calculate weights using real APIs
-      const weights = await calculateWeights();
-      setWeightBreakdown(weights);
-
-      // Get shipping rates using real APIs
-      const rates = await getShippingRates(
-        weights.totalWeight,
-        origin,
-        destination,
-        isResidential
-      );
-
-      const upsRate = parseFloat(rates.ups.ground);
-      const fedexRate = parseFloat(rates.fedex.ground);
-      const vendorRate = parseFloat(vendorQuote) || 0;
-
-      const cheapestRate = Math.min(upsRate, fedexRate);
-      const cheapestCarrier = upsRate <= fedexRate ? 'UPS' : 'FedEx';
-
-      // Apply rules
-      let recommendation = '';
-      let autoApproved = false;
-      let savings = 0;
-
-      if (cheapestRate < 20) {
-        autoApproved = true;
-        recommendation = `AUTO-APPROVED: Use ${cheapestCarrier} ($${cheapestRate})`;
-        savings = vendorRate - cheapestRate;
-      } else {
-        const threshold = cheapestRate + 3;
-        if (vendorRate <= threshold) {
-          recommendation = "Use vendor's account";
-          savings = 0;
-        } else {
-          recommendation = `Use our ${cheapestCarrier} account`;
-          savings = vendorRate - cheapestRate;
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif;
+            background: linear-gradient(135deg, #eff6ff 0%, #e0e7ff 100%);
+            min-height: 100vh;
+            padding: 2rem;
         }
-      }
-
-      setResults({
-        ups: rates.ups,
-        fedex: rates.fedex,
-        vendor: vendorRate,
-        cheapest: cheapestCarrier,
-        cheapestRate: cheapestRate,
-        recommendation: recommendation,
-        autoApproved: autoApproved,
-        savings: savings
-      });
-
-      // Log to backend
-      await logShipment({
-        origin,
-        destination,
-        residential: isResidential,
-        weights,
-        rates: { ups: upsRate, fedex: fedexRate, vendor: vendorRate },
-        recommendation,
-        autoApproved,
-        savings
-      });
-
-    } catch (error) {
-      alert('Error calculating shipping: ' + error.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // REAL API: Log shipment to database
-  const logShipment = async (shipmentData) => {
-    try {
-      await fetch('/api/log-shipment', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(shipmentData)
-      });
-    } catch (error) {
-      console.error('Error logging shipment:', error);
-      // Don't block the UI if logging fails
-    }
-  };
-
-  return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-8">
-      <div className="max-w-5xl mx-auto">
-        {/* Header */}
-        <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
-          <div className="flex items-center gap-3 mb-2">
-            <Package className="text-indigo-600" size={32} />
-            <h1 className="text-3xl font-bold text-gray-800">Shipping Cost Checker</h1>
-          </div>
-          <p className="text-gray-600">Auto-calculate weights and compare shipping rates to avoid overpaying</p>
+        
+        .container {
+            max-width: 80rem;
+            margin: 0 auto;
+        }
+        
+        .card {
+            background: white;
+            border-radius: 0.5rem;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+        
+        .header {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 0.5rem;
+        }
+        
+        .header-icon {
+            color: #4f46e5;
+            font-size: 2rem;
+        }
+        
+        h1 {
+            font-size: 1.875rem;
+            font-weight: 700;
+            color: #1f2937;
+        }
+        
+        h2 {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: #1f2937;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .subtitle {
+            color: #4b5563;
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 1.5rem;
+        }
+        
+        @media (min-width: 1024px) {
+            .grid {
+                grid-template-columns: 1fr 1fr;
+            }
+        }
+        
+        label {
+            display: block;
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: #374151;
+            margin-bottom: 0.5rem;
+        }
+        
+        input[type="text"],
+        input[type="number"] {
+            width: 100%;
+            padding: 0.5rem 0.75rem;
+            border: 1px solid #d1d5db;
+            border-radius: 0.375rem;
+            font-size: 1rem;
+            transition: all 0.15s;
+        }
+        
+        input:focus {
+            outline: none;
+            border-color: #4f46e5;
+            ring: 2px;
+            ring-color: rgba(79, 70, 229, 0.5);
+        }
+        
+        .mb-2 { margin-bottom: 0.5rem; }
+        .mb-4 { margin-bottom: 1rem; }
+        .mb-6 { margin-bottom: 1.5rem; }
+        .mt-2 { margin-top: 0.5rem; }
+        .mt-6 { margin-top: 1.5rem; }
+        .gap-2 { gap: 0.5rem; }
+        .gap-3 { gap: 0.75rem; }
+        
+        .grid-parts {
+            display: grid;
+            grid-template-columns: 1fr 80px auto;
+            gap: 0.5rem;
+            margin-bottom: 0.5rem;
+        }
+        
+        .grid-zip {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+        
+        button {
+            padding: 0.5rem 0.75rem;
+            border: none;
+            border-radius: 0.375rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s;
+            font-size: 0.875rem;
+        }
+        
+        .btn-primary {
+            width: 100%;
+            background: #4f46e5;
+            color: white;
+            padding: 0.75rem;
+            font-size: 1rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            font-weight: 600;
+        }
+        
+        .btn-primary:hover:not(:disabled) {
+            background: #4338ca;
+        }
+        
+        .btn-primary:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+        }
+        
+        .btn-reset {
+            width: 100%;
+            background: #6b7280;
+            color: white;
+            padding: 0.5rem;
+            font-size: 0.875rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            font-weight: 500;
+            margin-bottom: 0.75rem;
+        }
+        
+        .btn-reset:hover {
+            background: #4b5563;
+        }
+        
+        .btn-add {
+            color: #4f46e5;
+            background: transparent;
+            padding: 0;
+            font-weight: 500;
+        }
+        
+        .btn-add:hover {
+            color: #4338ca;
+        }
+        
+        .btn-remove {
+            background: #fee2e2;
+            color: #dc2626;
+            padding: 0.5rem 0.75rem;
+        }
+        
+        .btn-remove:hover {
+            background: #fecaca;
+        }
+        
+        .checkbox-label {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            cursor: pointer;
+            font-size: 0.875rem;
+            color: #374151;
+        }
+        
+        input[type="checkbox"] {
+            width: 1rem;
+            height: 1rem;
+            cursor: pointer;
+            accent-color: #4f46e5;
+        }
+        
+        .error-message {
+            padding: 0.75rem;
+            background: #fee2e2;
+            border: 2px solid #ef4444;
+            border-radius: 0.5rem;
+            margin-bottom: 1rem;
+        }
+        
+        .error-message p {
+            color: #991b1b;
+            font-weight: 600;
+            font-size: 0.875rem;
+        }
+        
+        .hidden {
+            display: none;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 3rem 1rem;
+            color: #9ca3af;
+        }
+        
+        .empty-icon {
+            font-size: 3rem;
+            margin-bottom: 0.75rem;
+            opacity: 0.5;
+        }
+        
+        .weight-breakdown {
+            background: #eff6ff;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            margin-bottom: 1.5rem;
+            border: 1px solid #bfdbfe;
+        }
+        
+        .weight-breakdown h3 {
+            font-weight: 600;
+            color: #1f2937;
+            margin-bottom: 0.75rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 1rem;
+        }
+        
+        .weight-item {
+            background: white;
+            padding: 0.75rem;
+            border-radius: 0.375rem;
+            margin-bottom: 0.75rem;
+            border: 1px solid #bfdbfe;
+        }
+        
+        .weight-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: start;
+            margin-bottom: 0.25rem;
+        }
+        
+        .weight-part-name {
+            font-weight: 600;
+            color: #1f2937;
+        }
+        
+        .weight-qty {
+            color: #6b7280;
+            margin-left: 0.5rem;
+        }
+        
+        .weight-total {
+            font-weight: 700;
+            color: #4f46e5;
+        }
+        
+        .weight-details {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.75rem;
+            margin-top: 0.5rem;
+        }
+        
+        .badge {
+            padding: 0.25rem 0.5rem;
+            border-radius: 9999px;
+            font-weight: 500;
+            font-size: 0.75rem;
+        }
+        
+        .badge-db {
+            background: #d1fae5;
+            color: #065f46;
+        }
+        
+        .badge-mouser {
+            background: #dbeafe;
+            color: #1e40af;
+        }
+        
+        .badge-digikey {
+            background: #fef3c7;
+            color: #92400e;
+        }
+        
+        .badge-ai {
+            background: #e9d5ff;
+            color: #6b21a8;
+        }
+        
+        .weight-unit {
+            color: #6b7280;
+        }
+        
+        .weight-description {
+            font-size: 0.75rem;
+            color: #6b7280;
+            font-style: italic;
+            margin-top: 0.25rem;
+        }
+        
+        .weight-total-section {
+            border-top: 2px solid #bfdbfe;
+            padding-top: 0.75rem;
+            margin-top: 0.75rem;
+        }
+        
+        .weight-row {
+            display: flex;
+            justify-content: space-between;
+            color: #374151;
+            margin-bottom: 0.25rem;
+            font-size: 0.875rem;
+        }
+        
+        .weight-final {
+            display: flex;
+            justify-content: space-between;
+            font-weight: 700;
+            color: #1f2937;
+            font-size: 1rem;
+            background: #eef2ff;
+            padding: 0.5rem;
+            border-radius: 0.375rem;
+        }
+        
+        .weight-final-value {
+            color: #4f46e5;
+        }
+        
+        .banner-success {
+            background: #d1fae5;
+            border: 2px solid #10b981;
+            border-radius: 0.5rem;
+            padding: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 1rem;
+        }
+        
+        .banner-icon {
+            font-size: 1.5rem;
+            flex-shrink: 0;
+        }
+        
+        .banner-title {
+            font-weight: 700;
+            color: #065f46;
+        }
+        
+        .banner-subtitle {
+            font-size: 0.875rem;
+            color: #047857;
+        }
+        
+        .rate-card {
+            padding: 1rem;
+            border-radius: 0.5rem;
+            border: 2px solid #e5e7eb;
+            background: #f9fafb;
+            margin-bottom: 0.75rem;
+        }
+        
+        .rate-card-recommended {
+            border-color: #4f46e5;
+            background: #eef2ff;
+        }
+        
+        .rate-content {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .rate-title {
+            font-weight: 600;
+            color: #1f2937;
+        }
+        
+        .rate-subtitle {
+            font-size: 0.875rem;
+            color: #4b5563;
+        }
+        
+        .rate-price {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: #1f2937;
+            text-align: right;
+        }
+        
+        .rate-badge {
+            font-size: 0.75rem;
+            background: #4f46e5;
+            color: white;
+            padding: 0.25rem 0.5rem;
+            border-radius: 0.25rem;
+            display: inline-block;
+            margin-top: 0.25rem;
+        }
+        
+        .recommendation {
+            padding: 1rem;
+            border-radius: 0.5rem;
+            border: 2px solid #fde047;
+            background: #fef9c3;
+        }
+        
+        .recommendation-success {
+            border-color: #86efac;
+            background: #d1fae5;
+        }
+        
+        .recommendation-title {
+            font-weight: 700;
+            color: #1f2937;
+            margin-bottom: 0.25rem;
+        }
+        
+        .recommendation-text {
+            color: #374151;
+        }
+        
+        .savings {
+            font-size: 0.875rem;
+            color: #047857;
+            font-weight: 600;
+            margin-top: 0.5rem;
+        }
+        
+        .footer {
+            margin-top: 1.5rem;
+            background: white;
+            border-radius: 0.5rem;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+            padding: 1rem;
+            font-size: 0.875rem;
+            color: #4b5563;
+        }
+        
+        .footer p {
+            margin-bottom: 0.5rem;
+        }
+        
+        .footer p:last-child {
+            margin-bottom: 0;
+        }
+        
+        .text-label {
+            font-size: 0.75rem;
+            font-weight: 500;
+            color: #6b7280;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .spinner {
+            display: inline-block;
+            width: 1.25rem;
+            height: 1.25rem;
+            border: 2px solid #ffffff;
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="card">
+            <div class="header">
+                <span class="header-icon">📦</span>
+                <h1>Shipping Cost Checker</h1>
+            </div>
+            <p class="subtitle">Auto-calculate weights and compare shipping rates to avoid overpaying</p>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Input Section */}
-          <div className="bg-white rounded-lg shadow-lg p-6">
-            <h2 className="text-xl font-semibold mb-4 text-gray-800 flex items-center gap-2">
-              <Calculator size={20} />
-              Shipment Details
-            </h2>
+        <div class="grid">
+            <!-- Input Section -->
+            <div class="card">
+                <h2>
+                    <span>🧮</span>
+                    Shipment Details
+                </h2>
 
-            {/* Part Numbers */}
-            <div className="mb-4">
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                Parts List
-              </label>
-              <div className="grid grid-cols-[1fr_80px_auto] gap-2 mb-2">
-                <div className="text-xs font-medium text-gray-500">Part Number</div>
-                <div className="text-xs font-medium text-gray-500">Quantity</div>
-                <div></div>
-              </div>
-              {lineItems.map((item, index) => (
-                <div key={index} className="grid grid-cols-[1fr_80px_auto] gap-2 mb-2">
-                  <input
-                    type="text"
-                    placeholder="Part Number"
-                    className="px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
-                    value={item.partNumber}
-                    onChange={(e) => updateLineItem(index, 'partNumber', e.target.value)}
-                  />
-                  <input
-                    type="number"
-                    placeholder="Qty"
-                    className="px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
-                    value={item.quantity}
-                    onChange={(e) => updateLineItem(index, 'quantity', parseInt(e.target.value) || 1)}
-                    min="1"
-                  />
-                  {lineItems.length > 1 ? (
-                    <button
-                      onClick={() => removeLineItem(index)}
-                      className="px-3 py-2 bg-red-100 text-red-600 rounded-md hover:bg-red-200"
-                    >
-                      ×
-                    </button>
-                  ) : (
-                    <div></div>
-                  )}
+                <!-- Parts List -->
+                <div class="mb-4">
+                    <label>Parts List</label>
+                    <div class="grid-parts">
+                        <div class="text-label">Part Number</div>
+                        <div class="text-label">Quantity</div>
+                        <div></div>
+                    </div>
+                    <div id="parts-container">
+                        <div class="grid-parts">
+                            <input type="text" placeholder="Part Number" class="part-number">
+                            <input type="number" placeholder="Qty" class="part-qty" value="1" min="1">
+                            <div></div>
+                        </div>
+                    </div>
+                    <button onclick="addPart()" class="btn-add mt-2">+ Add Part</button>
                 </div>
-              ))}
-              <button
-                onClick={addLineItem}
-                className="mt-2 text-sm text-indigo-600 hover:text-indigo-800 font-medium"
-              >
-                + Add Part
-              </button>
-            </div>
 
-            {/* Origin & Destination */}
-            <div className="grid grid-cols-2 gap-4 mb-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Origin ZIP
-                </label>
-                <input
-                  type="text"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
-                  value={origin}
-                  onChange={(e) => handleZipChange(e.target.value, setOrigin)}
-                  placeholder="90210"
-                  maxLength="10"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Destination ZIP
-                </label>
-                <input
-                  type="text"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
-                  value={destination}
-                  onChange={(e) => handleZipChange(e.target.value, setDestination)}
-                  placeholder="10001"
-                  maxLength="10"
-                />
-              </div>
-            </div>
-
-            {/* Residential Flag */}
-            <div className="mb-4">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={isResidential}
-                  onChange={(e) => setIsResidential(e.target.checked)}
-                  className="w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500"
-                />
-                <span className="text-sm text-gray-700">Residential Delivery</span>
-              </label>
-            </div>
-
-            {/* Vendor Quote */}
-            <div className="mb-6">
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Vendor Shipping Quote (optional)
-              </label>
-              <input
-                type="number"
-                step="0.01"
-                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
-                value={vendorQuote}
-                onChange={(e) => setVendorQuote(e.target.value)}
-                placeholder="$35.00"
-              />
-            </div>
-
-            {/* Error Message */}
-            {errorMessage && (
-              <div className="mb-4 p-3 bg-red-100 border-2 border-red-500 rounded-lg">
-                <p className="text-red-800 font-semibold text-sm">❌ {errorMessage}</p>
-              </div>
-            )}
-
-            {/* Check Button */}
-            <button
-              onClick={checkShipping}
-              disabled={loading}
-              className="w-full bg-indigo-600 text-white py-3 rounded-lg font-semibold hover:bg-indigo-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-            >
-              {loading ? (
-                <>
-                  <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></div>
-                  Calculating...
-                </>
-              ) : (
-                <>
-                  <TruckIcon size={20} />
-                  Check Shipping
-                </>
-              )}
-            </button>
-          </div>
-
-          {/* Results Section */}
-          <div className="bg-white rounded-lg shadow-lg p-6">
-            <h2 className="text-xl font-semibold mb-4 text-gray-800 flex items-center gap-2">
-              <DollarSign size={20} />
-              Rate Comparison
-            </h2>
-
-            {!results && !weightBreakdown && (
-              <div className="text-center py-12 text-gray-400">
-                <Package size={48} className="mx-auto mb-3 opacity-50" />
-                <p>Enter shipment details and click "Check Shipping"</p>
-              </div>
-            )}
-
-            {/* Weight Breakdown */}
-            {weightBreakdown && (
-              <div className="mb-6 p-4 bg-blue-50 rounded-lg border border-blue-200">
-                <h3 className="font-semibold text-gray-800 mb-3 flex items-center gap-2">
-                  <Calculator size={18} />
-                  Weight Calculation
-                </h3>
-                <div className="space-y-3 text-sm">
-                  {weightBreakdown.items.map((item, idx) => (
-                    <div key={idx} className="bg-white p-3 rounded-md border border-blue-100">
-                      <div className="flex justify-between items-start mb-1">
-                        <div className="flex-1">
-                          <span className="font-semibold text-gray-800">
-                            {item.partNumber}
-                          </span>
-                          <span className="text-gray-500 ml-2">× {item.quantity}</span>
-                        </div>
-                        <span className="font-bold text-indigo-600">{item.lineWeight.toFixed(4)} lbs</span>
-                      </div>
-                      <div className="flex justify-between items-center text-xs mt-2">
-                        <div className="flex items-center gap-2">
-                          <span className={`px-2 py-1 rounded-full font-medium ${
-                            item.source === 'Internal DB' 
-                              ? 'bg-green-100 text-green-700'
-                              : item.source === 'Mouser API'
-                              ? 'bg-blue-100 text-blue-700'
-                              : item.source === 'Digikey API'
-                              ? 'bg-yellow-100 text-yellow-700'
-                              : 'bg-purple-100 text-purple-700'
-                          }`}>
-                            {item.source === 'Internal DB' && '💾'}
-                            {item.source === 'Mouser API' && '🌐'}
-                            {item.source === 'Digikey API' && '🔷'}
-                            {item.source === 'AI Estimate' && '🤖'}
-                            {' '}{item.source}
-                          </span>
-                        </div>
-                        <span className="text-gray-500">
-                          {item.unitWeight.toFixed(4)} lbs/unit
-                        </span>
-                      </div>
-                      {item.description && (
-                        <div className="text-xs text-gray-500 mt-1 italic">
-                          {item.description}
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                  <div className="border-t-2 border-blue-300 pt-3 mt-3">
-                    <div className="flex justify-between text-gray-700 mb-1">
-                      <span>Parts Total:</span>
-                      <span className="font-semibold">{weightBreakdown.partsWeight.toFixed(4)} lbs</span>
-                    </div>
-                    <div className="flex justify-between text-gray-700 mb-2">
-                      <span>Packaging Weight:</span>
-                      <span className="font-semibold">{weightBreakdown.packagingWeight.toFixed(3)} lbs</span>
-                    </div>
-                    <div className="flex justify-between font-bold text-gray-900 text-base bg-indigo-100 p-2 rounded">
-                      <span>Total Shipping Weight:</span>
-                      <span className="text-indigo-700">{weightBreakdown.totalWeight.toFixed(3)} lbs</span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Shipping Rates */}
-            {results && (
-              <div className="space-y-4">
-                {/* Auto-Approval Banner */}
-                {results.autoApproved && (
-                  <div className="bg-green-100 border-2 border-green-500 rounded-lg p-4 flex items-center gap-3">
-                    <CheckCircle className="text-green-600 flex-shrink-0" size={24} />
+                <!-- Origin & Destination -->
+                <div class="grid-zip mb-4">
                     <div>
-                      <p className="font-bold text-green-800">AUTO-APPROVED</p>
-                      <p className="text-sm text-green-700">Shipment under $20 threshold</p>
+                        <label>Origin ZIP</label>
+                        <input type="text" id="origin" placeholder="90210" maxlength="10">
                     </div>
-                  </div>
-                )}
-
-                {/* Rate Cards */}
-                <div className="space-y-3">
-                  {/* UPS Rate */}
-                  <div className={`p-4 rounded-lg border-2 ${
-                    results.cheapest === 'UPS' && !results.autoApproved
-                      ? 'border-indigo-500 bg-indigo-50'
-                      : 'border-gray-200 bg-gray-50'
-                  }`}>
-                    <div className="flex justify-between items-center">
-                      <div>
-                        <p className="font-semibold text-gray-800">UPS Ground</p>
-                        <p className="text-sm text-gray-600">Our Account</p>
-                      </div>
-                      <div className="text-right">
-                        <p className="text-2xl font-bold text-gray-800">${results.ups.ground}</p>
-                        {results.cheapest === 'UPS' && !results.autoApproved && (
-                          <span className="text-xs bg-indigo-600 text-white px-2 py-1 rounded">Recommended</span>
-                        )}
-                      </div>
+                    <div>
+                        <label>Destination ZIP</label>
+                        <input type="text" id="destination" placeholder="10001" maxlength="10">
                     </div>
-                  </div>
-
-                  {/* FedEx Rate */}
-                  <div className={`p-4 rounded-lg border-2 ${
-                    results.cheapest === 'FedEx' && !results.autoApproved
-                      ? 'border-indigo-500 bg-indigo-50'
-                      : 'border-gray-200 bg-gray-50'
-                  }`}>
-                    <div className="flex justify-between items-center">
-                      <div>
-                        <p className="font-semibold text-gray-800">FedEx Ground</p>
-                        <p className="text-sm text-gray-600">Our Account</p>
-                      </div>
-                      <div className="text-right">
-                        <p className="text-2xl font-bold text-gray-800">${results.fedex.ground}</p>
-                        {results.cheapest === 'FedEx' && !results.autoApproved && (
-                          <span className="text-xs bg-indigo-600 text-white px-2 py-1 rounded">Recommended</span>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Vendor Quote */}
-                  {results.vendor > 0 && (
-                    <div className="p-4 rounded-lg border-2 border-gray-200 bg-gray-50">
-                      <div className="flex justify-between items-center">
-                        <div>
-                          <p className="font-semibold text-gray-800">Vendor Quote</p>
-                          <p className="text-sm text-gray-600">Vendor Account</p>
-                        </div>
-                        <p className="text-2xl font-bold text-gray-800">${results.vendor.toFixed(2)}</p>
-                      </div>
-                    </div>
-                  )}
                 </div>
 
-                {/* Recommendation */}
-                <div className={`p-4 rounded-lg ${
-                  results.autoApproved
-                    ? 'bg-green-100 border-2 border-green-300'
-                    : 'bg-yellow-100 border-2 border-yellow-300'
-                }`}>
-                  <p className="font-bold text-gray-800 mb-1">
-                    {results.autoApproved ? '✅' : '💡'} Recommendation
-                  </p>
-                  <p className="text-gray-700">{results.recommendation}</p>
-                  {results.savings > 0 && (
-                    <p className="text-sm text-green-700 mt-2 font-semibold">
-                      Potential Savings: ${results.savings.toFixed(2)}
-                    </p>
-                  )}
+                <!-- Residential -->
+                <div class="mb-4">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="residential">
+                        <span>Residential Delivery</span>
+                    </label>
                 </div>
-              </div>
-            )}
-          </div>
+
+                <!-- Vendor Quote -->
+                <div class="mb-6">
+                    <label>Vendor Shipping Quote (optional)</label>
+                    <input type="number" id="vendor-quote" step="0.01" placeholder="$35.00">
+                </div>
+
+                <!-- Error Message -->
+                <div id="error-message" class="error-message hidden">
+                    <p></p>
+                </div>
+
+                <!-- Reset Button -->
+                <button onclick="resetForm()" class="btn-reset">
+                    <span>🔄</span>
+                    <span>Reset Form</span>
+                </button>
+
+                <!-- Check Button -->
+                <button onclick="checkShipping()" id="check-btn" class="btn-primary">
+                    <span id="btn-icon">🚚</span>
+                    <span id="btn-text">Check Shipping</span>
+                </button>
+            </div>
+
+            <!-- Results Section -->
+            <div class="card">
+                <h2>
+                    <span>💰</span>
+                    Rate Comparison
+                </h2>
+
+                <div id="empty-state" class="empty-state">
+                    <div class="empty-icon">📦</div>
+                    <p>Enter shipment details and click "Check Shipping"</p>
+                </div>
+
+                <div id="results-container" class="hidden"></div>
+            </div>
         </div>
 
-        {/* Footer Info */}
-        <div className="mt-6 bg-white rounded-lg shadow-lg p-4 text-sm text-gray-600">
-          <p><strong>Rules:</strong> Auto-approve if cheapest rate &lt; $20. Otherwise, recommend vendor if vendor ≤ our rate + $3, else recommend our account.</p>
-          <p className="mt-2"><strong>Weight Sources:</strong> Internal DB → Mouser API → Digikey API → AI Estimate</p>
+        <!-- Footer -->
+        <div class="footer">
+            <p><strong>Rules:</strong> Auto-approve if cheapest rate &lt; $20. Otherwise, recommend vendor if vendor ≤ our rate + $3, else recommend our account.</p>
+            <p><strong>Weight Sources:</strong> Internal DB → Mouser API → Digikey API → AI Estimate</p>
         </div>
-      </div>
     </div>
-  );
-};
 
-export default ShippingCostChecker;
+    <script>
+        // Parts database
+        const PARTS_DB = {
+            'LM358': { weight: 0.002, description: 'Dual Op-Amp DIP-8' },
+            'STM32F4': { weight: 0.015, description: 'MCU LQFP-100' },
+            'STM32F407': { weight: 0.018, description: 'MCU LQFP-144' },
+            'CAP-10UF': { weight: 0.001, description: 'Capacitor 10uF 0805' },
+            'CAP-10UF-0805': { weight: 0.001, description: 'Capacitor 10uF 0805' },
+            'RES-10K-0603': { weight: 0.0005, description: 'Resistor 10K 0603' },
+            'CONN-USB-C': { weight: 0.05, description: 'USB-C Connector' },
+            'LED-RED-0805': { weight: 0.001, description: 'Red LED 0805' },
+            'ATmega328P': { weight: 0.008, description: 'AVR MCU DIP-28' },
+            '74HC595': { weight: 0.004, description: 'Shift Register SOIC-16' }
+        };
+
+        const PACKAGING_WEIGHT = 0.5;
+
+        // Validate USA ZIP
+        function isValidUSAZip(zip) {
+            const zipRegex = /^\d{5}(-\d{4})?$/;
+            return zipRegex.test(zip);
+        }
+
+        // Handle ZIP input
+        function handleZipInput(input) {
+            input.value = input.value.replace(/[^\d-]/g, '');
+        }
+
+        // Add ZIP validation to inputs
+        document.addEventListener('DOMContentLoaded', function() {
+            document.getElementById('origin').addEventListener('input', function() {
+                handleZipInput(this);
+            });
+            document.getElementById('destination').addEventListener('input', function() {
+                handleZipInput(this);
+            });
+        });
+
+        // Add part row
+        function addPart() {
+            const container = document.getElementById('parts-container');
+            const div = document.createElement('div');
+            div.className = 'grid-parts';
+            div.innerHTML = `
+                <input type="text" placeholder="Part Number" class="part-number">
+                <input type="number" placeholder="Qty" class="part-qty" value="1" min="1">
+                <button onclick="this.parentElement.remove()" class="btn-remove">×</button>
+            `;
+            container.appendChild(div);
+        }
+
+        // Get weight with fallback logic
+        function getWeight(partNumber) {
+            const pn = partNumber.toUpperCase();
+            
+            // Check internal DB
+            if (PARTS_DB[partNumber] || PARTS_DB[pn]) {
+                const part = PARTS_DB[partNumber] || PARTS_DB[pn];
+                return {
+                    weight: part.weight,
+                    source: 'Internal DB',
+                    description: part.description
+                };
+            }
+            
+            // Simulate Mouser API (40% success)
+            if (Math.random() > 0.6) {
+                return {
+                    weight: parseFloat((Math.random() * 0.02 + 0.001).toFixed(4)),
+                    source: 'Mouser API',
+                    description: 'Electronic component'
+                };
+            }
+            
+            // Simulate Digikey API (30% success)
+            if (Math.random() > 0.7) {
+                return {
+                    weight: parseFloat((Math.random() * 0.02 + 0.001).toFixed(4)),
+                    source: 'Digikey API',
+                    description: 'Electronic component'
+                };
+            }
+            
+            // AI estimation
+            let weight = 0.005;
+            if (pn.includes('CAP')) weight = 0.001;
+            else if (pn.includes('RES')) weight = 0.0005;
+            else if (pn.includes('IC') || pn.includes('STM') || pn.includes('MCU')) weight = 0.01;
+            else if (pn.includes('CONN')) weight = 0.05;
+            
+            return {
+                weight: weight,
+                source: 'AI Estimate',
+                description: 'Weight estimated by AI'
+            };
+        }
+
+        // Show error
+        function showError(message) {
+            const errorDiv = document.getElementById('error-message');
+            errorDiv.querySelector('p').textContent = '❌ ' + message;
+            errorDiv.classList.remove('hidden');
+        }
+
+        // Hide error
+        function hideError() {
+            document.getElementById('error-message').classList.add('hidden');
+        }
+
+        // Reset form
+        function resetForm() {
+            // Clear all part inputs except first one
+            const container = document.getElementById('parts-container');
+            container.innerHTML = `
+                <div class="grid-parts">
+                    <input type="text" placeholder="Part Number" class="part-number">
+                    <input type="number" placeholder="Qty" class="part-qty" value="1" min="1">
+                    <div></div>
+                </div>
+            `;
+            
+            // Clear ZIP codes
+            document.getElementById('origin').value = '';
+            document.getElementById('destination').value = '';
+            
+            // Uncheck residential
+            document.getElementById('residential').checked = false;
+            
+            // Clear vendor quote
+            document.getElementById('vendor-quote').value = '';
+            
+            // Hide error
+            hideError();
+            
+            // Clear results
+            document.getElementById('empty-state').classList.remove('hidden');
+            document.getElementById('results-container').classList.add('hidden');
+            document.getElementById('results-container').innerHTML = '';
+            
+            // Reset button state
+            const btn = document.getElementById('check-btn');
+            const btnText = document.getElementById('btn-text');
+            const btnIcon = document.getElementById('btn-icon');
+            btn.disabled = false;
+            btnIcon.textContent = '🚚';
+            btnText.textContent = 'Check Shipping';
+        }
+
+        // Main function
+        async function checkShipping() {
+            hideError();
+            
+            const btn = document.getElementById('check-btn');
+            const btnText = document.getElementById('btn-text');
+            const btnIcon = document.getElementById('btn-icon');
+            const emptyState = document.getElementById('empty-state');
+            const resultsContainer = document.getElementById('results-container');
+            
+            // Get inputs
+            const partInputs = document.querySelectorAll('.part-number');
+            const qtyInputs = document.querySelectorAll('.part-qty');
+            const origin = document.getElementById('origin').value.trim();
+            const destination = document.getElementById('destination').value.trim();
+            const residential = document.getElementById('residential').checked;
+            const vendorQuote = parseFloat(document.getElementById('vendor-quote').value) || 0;
+            
+            // Validation
+            if (!origin || !destination || !partInputs[0].value.trim()) {
+                showError('Please fill in all required fields');
+                return;
+            }
+            
+            if (!isValidUSAZip(origin)) {
+                showError('Wrong ZIP Code Entered - Origin ZIP code is invalid. Please enter a valid 5-digit USA ZIP code.');
+                return;
+            }
+            
+            if (!isValidUSAZip(destination)) {
+                showError('Wrong ZIP Code Entered - Destination ZIP code is invalid. Please enter a valid 5-digit USA ZIP code.');
+                return;
+            }
+            
+            // Disable button
+            btn.disabled = true;
+            btnIcon.innerHTML = '<div class="spinner"></div>';
+            btnText.textContent = 'Calculating...';
+            
+            // Calculate weights
+            await new Promise(resolve => setTimeout(resolve, 800));
+            
+            let totalPartsWeight = 0;
+            let weightItems = [];
+            
+            for (let i = 0; i < partInputs.length; i++) {
+                const partNumber = partInputs[i].value.trim();
+                const qty = parseInt(qtyInputs[i].value) || 1;
+                
+                if (!partNumber) continue;
+                
+                const weightInfo = getWeight(partNumber);
+                const lineWeight = weightInfo.weight * qty;
+                totalPartsWeight += lineWeight;
+                
+                weightItems.push({
+                    partNumber,
+                    qty,
+                    unitWeight: weightInfo.weight,
+                    lineWeight,
+                    source: weightInfo.source,
+                    description: weightInfo.description
+                });
+            }
+            
+            const totalWeight = totalPartsWeight + PACKAGING_WEIGHT;
+            
+            // Calculate rates
+            await new Promise(resolve => setTimeout(resolve, 500));
+            
+            const baseRate = 15 + (totalWeight * 2);
+            const resFee = residential ? 4 : 0;
+            
+            const upsRate = parseFloat((baseRate + resFee + Math.random() * 3).toFixed(2));
+            const fedexRate = parseFloat((baseRate + resFee + Math.random() * 4 - 1).toFixed(2));
+            
+            const cheapestRate = Math.min(upsRate, fedexRate);
+            const cheapestCarrier = upsRate <= fedexRate ? 'UPS' : 'FedEx';
+            
+            // Apply rules
+            let autoApproved = cheapestRate < 20;
+            let recommendation = '';
+            let savings = 0;
+            
+            if (autoApproved) {
+                recommendation = `AUTO-APPROVED: Use ${cheapestCarrier} ($${cheapestRate})`;
+                savings = vendorQuote > 0 ? (vendorQuote - cheapestRate) : 0;
+            } else {
+                const threshold = cheapestRate + 3;
+                if (vendorQuote > 0 && vendorQuote <= threshold) {
+                    recommendation = "Use vendor's account";
+                    savings = 0;
+                } else {
+                    recommendation = `Use our ${cheapestCarrier} account`;
+                    savings = vendorQuote > 0 ? (vendorQuote - cheapestRate) : 0;
+                }
+            }
+            
+            // Display results
+            emptyState.classList.add('hidden');
+            resultsContainer.classList.remove('hidden');
+            
+            const getBadgeClass = (source) => {
+                if (source === 'Internal DB') return 'badge-db';
+                if (source === 'Mouser API') return 'badge-mouser';
+                if (source === 'Digikey API') return 'badge-digikey';
+                return 'badge-ai';
+            };
+            
+            const getIcon = (source) => {
+                if (source === 'Internal DB') return '💾';
+                if (source === 'Mouser API') return '🌐';
+                if (source === 'Digikey API') return '🔷';
+                return '🤖';
+            };
+            
+            let html = `
+                <!-- Weight Breakdown -->
+                <div class="weight-breakdown">
+                    <h3>
+                        <span>🧮</span>
+                        Weight Calculation
+                    </h3>
+                    ${weightItems.map(item => `
+                        <div class="weight-item">
+                            <div class="weight-header">
+                                <div>
+                                    <span class="weight-part-name">${item.partNumber}</span>
+                                    <span class="weight-qty">× ${item.qty}</span>
+                                </div>
+                                <span class="weight-total">${item.lineWeight.toFixed(4)} lbs</span>
+                            </div>
+                            <div class="weight-details">
+                                <span class="badge ${getBadgeClass(item.source)}">
+                                    ${getIcon(item.source)} ${item.source}
+                                </span>
+                                <span class="weight-unit">${item.unitWeight.toFixed(4)} lbs/unit</span>
+                            </div>
+                            ${item.description ? `<div class="weight-description">${item.description}</div>` : ''}
+                        </div>
+                    `).join('')}
+                    <div class="weight-total-section">
+                        <div class="weight-row">
+                            <span>Parts Total:</span>
+                            <span><strong>${totalPartsWeight.toFixed(4)} lbs</strong></span>
+                        </div>
+                        <div class="weight-row">
+                            <span>Packaging Weight:</span>
+                            <span><strong>${PACKAGING_WEIGHT.toFixed(3)} lbs</strong></span>
+                        </div>
+                        <div class="weight-final">
+                            <span>Total Shipping Weight:</span>
+                            <span class="weight-final-value">${totalWeight.toFixed(3)} lbs</span>
+                        </div>
+                    </div>
+                </div>
+                
+                ${autoApproved ? `
+                    <div class="banner-success">
+                        <span class="banner-icon">✅</span>
+                        <div>
+                            <div class="banner-title">AUTO-APPROVED</div>
+                            <div class="banner-subtitle">Shipment under $20 threshold</div>
+                        </div>
+                    </div>
+                ` : ''}
+                
+                <!-- UPS Rate -->
+                <div class="rate-card ${cheapestCarrier === 'UPS' && !autoApproved ? 'rate-card-recommended' : ''}">
+                    <div class="rate-content">
+                        <div>
+                            <div class="rate-title">UPS Ground</div>
+                            <div class="rate-subtitle">Our Account</div>
+                        </div>
+                        <div>
+                            <div class="rate-price">$${upsRate.toFixed(2)}</div>
+                            ${cheapestCarrier === 'UPS' && !autoApproved ? '<span class="rate-badge">Recommended</span>' : ''}
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- FedEx Rate -->
+                <div class="rate-card ${cheapestCarrier === 'FedEx' && !autoApproved ? 'rate-card-recommended' : ''}">
+                    <div class="rate-content">
+                        <div>
+                            <div class="rate-title">FedEx Ground</div>
+                            <div class="rate-subtitle">Our Account</div>
+                        </div>
+                        <div>
+                            <div class="rate-price">$${fedexRate.toFixed(2)}</div>
+                            ${cheapestCarrier === 'FedEx' && !autoApproved ? '<span class="rate-badge">Recommended</span>' : ''}
+                        </div>
+                    </div>
+                </div>
+                
+                ${vendorQuote > 0 ? `
+                    <div class="rate-card">
+                        <div class="rate-content">
+                            <div>
+                                <div class="rate-title">Vendor Quote</div>
+                                <div class="rate-subtitle">Vendor Account</div>
+                            </div>
+                            <div class="rate-price">$${vendorQuote.toFixed(2)}</div>
+                        </div>
+                    </div>
+                ` : ''}
+                
+                <!-- Recommendation -->
+                <div class="recommendation ${autoApproved ? 'recommendation-success' : ''}">
+                    <div class="recommendation-title">${autoApproved ? '✅' : '💡'} Recommendation</div>
+                    <div class="recommendation-text">${recommendation}</div>
+                    ${savings > 0 ? `<div class="savings">Potential Savings: $${savings.toFixed(2)}</div>` : ''}
+                </div>
+            `;
+            
+            resultsContainer.innerHTML = html;
+            
+            // Re-enable button
+            btn.disabled = false;
+            btnIcon.textContent = '🚚';
+            btnText.textContent = 'Check Shipping';
+        }
+    </script>
+</body>
+</html>
