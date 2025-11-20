@@ -606,20 +606,6 @@
     </div>
 
     <script>
-        // Parts database
-        const PARTS_DB = {
-            'LM358': { weight: 0.002, description: 'Dual Op-Amp DIP-8' },
-            'STM32F4': { weight: 0.015, description: 'MCU LQFP-100' },
-            'STM32F407': { weight: 0.018, description: 'MCU LQFP-144' },
-            'CAP-10UF': { weight: 0.001, description: 'Capacitor 10uF 0805' },
-            'CAP-10UF-0805': { weight: 0.001, description: 'Capacitor 10uF 0805' },
-            'RES-10K-0603': { weight: 0.0005, description: 'Resistor 10K 0603' },
-            'CONN-USB-C': { weight: 0.05, description: 'USB-C Connector' },
-            'LED-RED-0805': { weight: 0.001, description: 'Red LED 0805' },
-            'ATmega328P': { weight: 0.008, description: 'AVR MCU DIP-28' },
-            '74HC595': { weight: 0.004, description: 'Shift Register SOIC-16' }
-        };
-
         const PACKAGING_WEIGHT = 0.5;
 
         // Validate USA ZIP
@@ -656,52 +642,6 @@
             container.appendChild(div);
         }
 
-        // Get weight with fallback logic
-        function getWeight(partNumber) {
-            const pn = partNumber.toUpperCase();
-            
-            // Check internal DB
-            if (PARTS_DB[partNumber] || PARTS_DB[pn]) {
-                const part = PARTS_DB[partNumber] || PARTS_DB[pn];
-                return {
-                    weight: part.weight,
-                    source: 'Internal DB',
-                    description: part.description
-                };
-            }
-            
-            // Simulate Mouser API (40% success)
-            if (Math.random() > 0.6) {
-                return {
-                    weight: parseFloat((Math.random() * 0.02 + 0.001).toFixed(4)),
-                    source: 'Mouser API',
-                    description: 'Electronic component'
-                };
-            }
-            
-            // Simulate Digikey API (30% success)
-            if (Math.random() > 0.7) {
-                return {
-                    weight: parseFloat((Math.random() * 0.02 + 0.001).toFixed(4)),
-                    source: 'Digikey API',
-                    description: 'Electronic component'
-                };
-            }
-            
-            // AI estimation
-            let weight = 0.005;
-            if (pn.includes('CAP')) weight = 0.001;
-            else if (pn.includes('RES')) weight = 0.0005;
-            else if (pn.includes('IC') || pn.includes('STM') || pn.includes('MCU')) weight = 0.01;
-            else if (pn.includes('CONN')) weight = 0.05;
-            
-            return {
-                weight: weight,
-                source: 'AI Estimate',
-                description: 'Weight estimated by AI'
-            };
-        }
-
         // Show error
         function showError(message) {
             const errorDiv = document.getElementById('error-message');
@@ -712,6 +652,100 @@
         // Hide error
         function hideError() {
             document.getElementById('error-message').classList.add('hidden');
+        }
+
+        // Call Netlify function to get part weight
+        async function fetchPartWeight(partNumber) {
+            try {
+                const response = await fetch('/.netlify/functions/get-part-weight', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ partNumber })
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to get part weight');
+                }
+
+                const data = await response.json();
+                if (!data.weight || isNaN(data.weight)) {
+                    throw new Error('Invalid weight from API');
+                }
+
+                return {
+                    weight: Number(data.weight),
+                    source: data.source || 'Unknown',
+                    description: data.description || ''
+                };
+            } catch (error) {
+                console.error('get-part-weight error for', partNumber, error);
+                // Fallback: 0.01 lb with AI label
+                return {
+                    weight: 0.01,
+                    source: 'AI Estimate',
+                    description: 'Fallback estimated weight (API error)'
+                };
+            }
+        }
+
+        // Call Netlify function to get shipping rates
+        async function fetchShippingRates(weight, originZip, destZip, residential) {
+            try {
+                const response = await fetch('/.netlify/functions/get-shipping-rates', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        weight,
+                        originZip,
+                        destZip,
+                        residential
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to get shipping rates');
+                }
+
+                const data = await response.json();
+
+                const upsRate = data?.ups?.ground ? parseFloat(data.ups.ground) : NaN;
+                const fedexRate = data?.fedex?.ground ? parseFloat(data.fedex.ground) : NaN;
+
+                if (isNaN(upsRate) || isNaN(fedexRate)) {
+                    throw new Error('Invalid rate data from API');
+                }
+
+                return {
+                    ups: { ground: upsRate, service: data.ups.service || 'UPS Ground' },
+                    fedex: { ground: fedexRate, service: data.fedex.service || 'FedEx Ground' }
+                };
+            } catch (error) {
+                console.error('get-shipping-rates error', error);
+                // Fallback to simple formula similar to old behavior
+                const baseRate = 15 + (weight * 2);
+                const resFee = residential ? 4 : 0;
+                const upsRate = baseRate + resFee + Math.random() * 3;
+                const fedexRate = baseRate + resFee + Math.random() * 4 - 1;
+
+                return {
+                    ups: { ground: upsRate, service: 'UPS Ground (fallback)' },
+                    fedex: { ground: fedexRate, service: 'FedEx Ground (fallback)' }
+                };
+            }
+        }
+
+        // Call Netlify function to log shipment
+        async function logShipment(payload) {
+            try {
+                await fetch('/.netlify/functions/log-shipment', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+            } catch (error) {
+                console.error('log-shipment error', error);
+                // Don't block UI on logging failure
+            }
         }
 
         // Reset form
@@ -791,189 +825,211 @@
             btn.disabled = true;
             btnIcon.innerHTML = '<div class="spinner"></div>';
             btnText.textContent = 'Calculating...';
-            
-            // Calculate weights
-            await new Promise(resolve => setTimeout(resolve, 800));
-            
-            let totalPartsWeight = 0;
-            let weightItems = [];
-            
-            for (let i = 0; i < partInputs.length; i++) {
-                const partNumber = partInputs[i].value.trim();
-                const qty = parseInt(qtyInputs[i].value) || 1;
-                
-                if (!partNumber) continue;
-                
-                const weightInfo = getWeight(partNumber);
-                const lineWeight = weightInfo.weight * qty;
-                totalPartsWeight += lineWeight;
-                
-                weightItems.push({
-                    partNumber,
-                    qty,
-                    unitWeight: weightInfo.weight,
-                    lineWeight,
-                    source: weightInfo.source,
-                    description: weightInfo.description
-                });
-            }
-            
-            const totalWeight = totalPartsWeight + PACKAGING_WEIGHT;
-            
-            // Calculate rates
-            await new Promise(resolve => setTimeout(resolve, 500));
-            
-            const baseRate = 15 + (totalWeight * 2);
-            const resFee = residential ? 4 : 0;
-            
-            const upsRate = parseFloat((baseRate + resFee + Math.random() * 3).toFixed(2));
-            const fedexRate = parseFloat((baseRate + resFee + Math.random() * 4 - 1).toFixed(2));
-            
-            const cheapestRate = Math.min(upsRate, fedexRate);
-            const cheapestCarrier = upsRate <= fedexRate ? 'UPS' : 'FedEx';
-            
-            // Apply rules
-            let autoApproved = cheapestRate < 20;
-            let recommendation = '';
-            let savings = 0;
-            
-            if (autoApproved) {
-                recommendation = `AUTO-APPROVED: Use ${cheapestCarrier} ($${cheapestRate})`;
-                savings = vendorQuote > 0 ? (vendorQuote - cheapestRate) : 0;
-            } else {
-                const threshold = cheapestRate + 3;
-                if (vendorQuote > 0 && vendorQuote <= threshold) {
-                    recommendation = "Use vendor's account";
-                    savings = 0;
-                } else {
-                    recommendation = `Use our ${cheapestCarrier} account`;
-                    savings = vendorQuote > 0 ? (vendorQuote - cheapestRate) : 0;
+
+            try {
+                // Collect weights
+                let totalPartsWeight = 0;
+                let weightItems = [];
+
+                for (let i = 0; i < partInputs.length; i++) {
+                    const partNumber = partInputs[i].value.trim();
+                    const qty = parseInt(qtyInputs[i].value) || 1;
+                    
+                    if (!partNumber) continue;
+
+                    // Call backend for each part weight
+                    const weightInfo = await fetchPartWeight(partNumber);
+                    const lineWeight = weightInfo.weight * qty;
+                    totalPartsWeight += lineWeight;
+
+                    weightItems.push({
+                        partNumber,
+                        qty,
+                        unitWeight: weightInfo.weight,
+                        lineWeight,
+                        source: weightInfo.source,
+                        description: weightInfo.description
+                    });
                 }
-            }
-            
-            // Display results
-            emptyState.classList.add('hidden');
-            resultsContainer.classList.remove('hidden');
-            
-            const getBadgeClass = (source) => {
-                if (source === 'Internal DB') return 'badge-db';
-                if (source === 'Mouser API') return 'badge-mouser';
-                if (source === 'Digikey API') return 'badge-digikey';
-                return 'badge-ai';
-            };
-            
-            const getIcon = (source) => {
-                if (source === 'Internal DB') return '💾';
-                if (source === 'Mouser API') return '🌐';
-                if (source === 'Digikey API') return '🔷';
-                return '🤖';
-            };
-            
-            let html = `
-                <!-- Weight Breakdown -->
-                <div class="weight-breakdown">
-                    <h3>
-                        <span>🧮</span>
-                        Weight Calculation
-                    </h3>
-                    ${weightItems.map(item => `
-                        <div class="weight-item">
-                            <div class="weight-header">
-                                <div>
-                                    <span class="weight-part-name">${item.partNumber}</span>
-                                    <span class="weight-qty">× ${item.qty}</span>
+
+                const totalWeight = totalPartsWeight + PACKAGING_WEIGHT;
+
+                // Get shipping rates from backend
+                const rates = await fetchShippingRates(totalWeight, origin, destination, residential);
+                const upsRate = rates.ups.ground;
+                const fedexRate = rates.fedex.ground;
+
+                const cheapestRate = Math.min(upsRate, fedexRate);
+                const cheapestCarrier = upsRate <= fedexRate ? 'UPS' : 'FedEx';
+                
+                // Apply rules
+                let autoApproved = cheapestRate < 20;
+                let recommendation = '';
+                let savings = 0;
+                
+                if (autoApproved) {
+                    recommendation = `AUTO-APPROVED: Use ${cheapestCarrier} ($${cheapestRate.toFixed(2)})`;
+                    savings = vendorQuote > 0 ? (vendorQuote - cheapestRate) : 0;
+                } else {
+                    const threshold = cheapestRate + 3;
+                    if (vendorQuote > 0 && vendorQuote <= threshold) {
+                        recommendation = "Use vendor's account";
+                        savings = 0;
+                    } else {
+                        recommendation = `Use our ${cheapestCarrier} account`;
+                        savings = vendorQuote > 0 ? (vendorQuote - cheapestRate) : 0;
+                    }
+                }
+
+                // Display results
+                emptyState.classList.add('hidden');
+                resultsContainer.classList.remove('hidden');
+                
+                const getBadgeClass = (source) => {
+                    if (source === 'Internal DB') return 'badge-db';
+                    if (source === 'Mouser API') return 'badge-mouser';
+                    if (source === 'Digikey API') return 'badge-digikey';
+                    return 'badge-ai';
+                };
+                
+                const getIcon = (source) => {
+                    if (source === 'Internal DB') return '💾';
+                    if (source === 'Mouser API') return '🌐';
+                    if (source === 'Digikey API') return '🔷';
+                    return '🤖';
+                };
+                
+                let html = `
+                    <!-- Weight Breakdown -->
+                    <div class="weight-breakdown">
+                        <h3>
+                            <span>🧮</span>
+                            Weight Calculation
+                        </h3>
+                        ${weightItems.map(item => `
+                            <div class="weight-item">
+                                <div class="weight-header">
+                                    <div>
+                                        <span class="weight-part-name">${item.partNumber}</span>
+                                        <span class="weight-qty">× ${item.qty}</span>
+                                    </div>
+                                    <span class="weight-total">${item.lineWeight.toFixed(4)} lbs</span>
                                 </div>
-                                <span class="weight-total">${item.lineWeight.toFixed(4)} lbs</span>
+                                <div class="weight-details">
+                                    <span class="badge ${getBadgeClass(item.source)}">
+                                        ${getIcon(item.source)} ${item.source}
+                                    </span>
+                                    <span class="weight-unit">${item.unitWeight.toFixed(4)} lbs/unit</span>
+                                </div>
+                                ${item.description ? `<div class="weight-description">${item.description}</div>` : ''}
                             </div>
-                            <div class="weight-details">
-                                <span class="badge ${getBadgeClass(item.source)}">
-                                    ${getIcon(item.source)} ${item.source}
-                                </span>
-                                <span class="weight-unit">${item.unitWeight.toFixed(4)} lbs/unit</span>
+                        `).join('')}
+                        <div class="weight-total-section">
+                            <div class="weight-row">
+                                <span>Parts Total:</span>
+                                <span><strong>${totalPartsWeight.toFixed(4)} lbs</strong></span>
                             </div>
-                            ${item.description ? `<div class="weight-description">${item.description}</div>` : ''}
-                        </div>
-                    `).join('')}
-                    <div class="weight-total-section">
-                        <div class="weight-row">
-                            <span>Parts Total:</span>
-                            <span><strong>${totalPartsWeight.toFixed(4)} lbs</strong></span>
-                        </div>
-                        <div class="weight-row">
-                            <span>Packaging Weight:</span>
-                            <span><strong>${PACKAGING_WEIGHT.toFixed(3)} lbs</strong></span>
-                        </div>
-                        <div class="weight-final">
-                            <span>Total Shipping Weight:</span>
-                            <span class="weight-final-value">${totalWeight.toFixed(3)} lbs</span>
+                            <div class="weight-row">
+                                <span>Packaging Weight:</span>
+                                <span><strong>${PACKAGING_WEIGHT.toFixed(3)} lbs</strong></span>
+                            </div>
+                            <div class="weight-final">
+                                <span>Total Shipping Weight:</span>
+                                <span class="weight-final-value">${totalWeight.toFixed(3)} lbs</span>
+                            </div>
                         </div>
                     </div>
-                </div>
-                
-                ${autoApproved ? `
-                    <div class="banner-success">
-                        <span class="banner-icon">✅</span>
-                        <div>
-                            <div class="banner-title">AUTO-APPROVED</div>
-                            <div class="banner-subtitle">Shipment under $20 threshold</div>
+                    
+                    ${autoApproved ? `
+                        <div class="banner-success">
+                            <span class="banner-icon">✅</span>
+                            <div>
+                                <div class="banner-title">AUTO-APPROVED</div>
+                                <div class="banner-subtitle">Shipment under $20 threshold</div>
+                            </div>
                         </div>
-                    </div>
-                ` : ''}
-                
-                <!-- UPS Rate -->
-                <div class="rate-card ${cheapestCarrier === 'UPS' && !autoApproved ? 'rate-card-recommended' : ''}">
-                    <div class="rate-content">
-                        <div>
-                            <div class="rate-title">UPS Ground</div>
-                            <div class="rate-subtitle">Our Account</div>
-                        </div>
-                        <div>
-                            <div class="rate-price">$${upsRate.toFixed(2)}</div>
-                            ${cheapestCarrier === 'UPS' && !autoApproved ? '<span class="rate-badge">Recommended</span>' : ''}
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- FedEx Rate -->
-                <div class="rate-card ${cheapestCarrier === 'FedEx' && !autoApproved ? 'rate-card-recommended' : ''}">
-                    <div class="rate-content">
-                        <div>
-                            <div class="rate-title">FedEx Ground</div>
-                            <div class="rate-subtitle">Our Account</div>
-                        </div>
-                        <div>
-                            <div class="rate-price">$${fedexRate.toFixed(2)}</div>
-                            ${cheapestCarrier === 'FedEx' && !autoApproved ? '<span class="rate-badge">Recommended</span>' : ''}
-                        </div>
-                    </div>
-                </div>
-                
-                ${vendorQuote > 0 ? `
-                    <div class="rate-card">
+                    ` : ''}
+                    
+                    <!-- UPS Rate -->
+                    <div class="rate-card ${cheapestCarrier === 'UPS' && !autoApproved ? 'rate-card-recommended' : ''}">
                         <div class="rate-content">
                             <div>
-                                <div class="rate-title">Vendor Quote</div>
-                                <div class="rate-subtitle">Vendor Account</div>
+                                <div class="rate-title">UPS Ground</div>
+                                <div class="rate-subtitle">Our Account</div>
                             </div>
-                            <div class="rate-price">$${vendorQuote.toFixed(2)}</div>
+                            <div>
+                                <div class="rate-price">$${upsRate.toFixed(2)}</div>
+                                ${cheapestCarrier === 'UPS' && !autoApproved ? '<span class="rate-badge">Recommended</span>' : ''}
+                            </div>
                         </div>
                     </div>
-                ` : ''}
+                    
+                    <!-- FedEx Rate -->
+                    <div class="rate-card ${cheapestCarrier === 'FedEx' && !autoApproved ? 'rate-card-recommended' : ''}">
+                        <div class="rate-content">
+                            <div>
+                                <div class="rate-title">FedEx Ground</div>
+                                <div class="rate-subtitle">Our Account</div>
+                            </div>
+                            <div>
+                                <div class="rate-price">$${fedexRate.toFixed(2)}</div>
+                                ${cheapestCarrier === 'FedEx' && !autoApproved ? '<span class="rate-badge">Recommended</span>' : ''}
+                            </div>
+                        </div>
+                    </div>
+                    
+                    ${vendorQuote > 0 ? `
+                        <div class="rate-card">
+                            <div class="rate-content">
+                                <div>
+                                    <div class="rate-title">Vendor Quote</div>
+                                    <div class="rate-subtitle">Vendor Account</div>
+                                </div>
+                                <div class="rate-price">$${vendorQuote.toFixed(2)}</div>
+                            </div>
+                        </div>
+                    ` : ''}
+                    
+                    <!-- Recommendation -->
+                    <div class="recommendation ${autoApproved ? 'recommendation-success' : ''}">
+                        <div class="recommendation-title">${autoApproved ? '✅' : '💡'} Recommendation</div>
+                        <div class="recommendation-text">${recommendation}</div>
+                        ${savings > 0 ? `<div class="savings">Potential Savings: $${savings.toFixed(2)}</div>` : ''}
+                    </div>
+                `;
                 
-                <!-- Recommendation -->
-                <div class="recommendation ${autoApproved ? 'recommendation-success' : ''}">
-                    <div class="recommendation-title">${autoApproved ? '✅' : '💡'} Recommendation</div>
-                    <div class="recommendation-text">${recommendation}</div>
-                    ${savings > 0 ? `<div class="savings">Potential Savings: $${savings.toFixed(2)}</div>` : ''}
-                </div>
-            `;
-            
-            resultsContainer.innerHTML = html;
-            
-            // Re-enable button
-            btn.disabled = false;
-            btnIcon.textContent = '🚚';
-            btnText.textContent = 'Check Shipping';
+                resultsContainer.innerHTML = html;
+
+                // Log shipment (non-blocking)
+                logShipment({
+                    origin,
+                    destination,
+                    residential,
+                    vendorQuote,
+                    weights: {
+                        items: weightItems,
+                        partsWeight: totalPartsWeight,
+                        packagingWeight: PACKAGING_WEIGHT,
+                        totalWeight
+                    },
+                    rates: {
+                        ups: upsRate,
+                        fedex: fedexRate,
+                        vendor: vendorQuote
+                    },
+                    recommendation,
+                    autoApproved,
+                    savings
+                });
+            } catch (err) {
+                console.error('checkShipping error', err);
+                showError('Something went wrong while calculating shipping. Please try again.');
+            } finally {
+                // Re-enable button
+                btn.disabled = false;
+                btnIcon.textContent = '🚚';
+                btnText.textContent = 'Check Shipping';
+            }
         }
     </script>
 </body>
