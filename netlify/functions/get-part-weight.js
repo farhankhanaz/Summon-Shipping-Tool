@@ -2,13 +2,19 @@
 
 export async function handler(event) {
   try {
-    const part = (event.queryStringParameters?.part || "").trim();
+    const qs = event.queryStringParameters || {};
+    const part = (qs.part || "").trim();
+    const qty = parseInt(qs.qty || "1", 10);
+
     if (!part) return json(400, { error: "Missing ?part=..." });
+    if (!Number.isFinite(qty) || qty <= 0) return json(400, { error: "Invalid ?qty= (must be >= 1)" });
 
     const apiKey = process.env.MOUSER_API_KEY;
-    if (!apiKey) return json(500, { error: "MOUSER_API_KEY not set in Netlify environment variables" });
+    if (!apiKey) {
+      return json(500, { error: "MOUSER_API_KEY not set in Netlify environment variables" });
+    }
 
-    // 1) Mouser API search (part number endpoint)
+    // 1) Mouser Part Number Search (to identify part)
     const apiUrl = `https://api.mouser.com/api/v1/search/partnumber?apiKey=${encodeURIComponent(apiKey)}`;
 
     const apiResp = await fetch(apiUrl, {
@@ -27,73 +33,80 @@ export async function handler(event) {
       return json(apiResp.status, { error: "Mouser API request failed", details: apiData });
     }
 
-    // Mouser response can vary; these cover common shapes
-    const products =
-      apiData?.SearchResults?.Parts ||
-      apiData?.SearchResults?.Parts?.Parts ||
-      apiData?.SearchResults?.Parts?.Part ||
-      [];
-
-    const first = Array.isArray(products) ? products[0] : null;
+    const parts = apiData?.SearchResults?.Parts;
+    const first = Array.isArray(parts) ? parts[0] : null;
 
     if (!first) {
       return json(200, {
         weight: null,
-        source: "Mouser API",
-        description: null,
-        manufacturer: null,
-        manufacturerPartNumber: part,
-        mouserPartNumber: null,
-        productUrl: null,
-        datasheetUrl: null,
-        rawWeight: null,
-        scrapedFromHtml: null,
-        parsedFrom: null,
+        unitWeightLbs: null,
+        unitWeightG: null,
+        qty,
+        totalWeightLbs: null,
+        totalWeightG: null,
+        source: "Mouser (Not Found)",
         error: "Not found on Mouser",
       });
     }
 
-    const productUrl = first.ProductDetailUrl || null;
+    // Keep useful identifiers
+    const manufacturer = first.Manufacturer || null;
+    const manufacturerPartNumber = first.ManufacturerPartNumber || null;
+    const mouserPartNumber = first.MouserPartNumber || null;
+    const description = first.Description || null;
 
-    // 2) Try to read weight from API fields / attributes
-    const rawWeightFromApi =
-      first.Weight ||
-      first.UnitWeight ||
-      first?.ProductAttributes?.find?.((a) => /unit\s*weight|weight/i.test(a?.AttributeName || ""))?.AttributeValue ||
-      null;
+    // 2) Try to infer package from MPN / Mouser PN / description
+    const packageCode = inferSmdPackage({
+      part,
+      manufacturerPartNumber,
+      mouserPartNumber,
+      description,
+    });
 
-    let rawWeight = rawWeightFromApi;
-    let scrapedFromHtml = null;
+    // 3) Package → typical unit weight (grams)
+    const unitWeightG = packageCode ? typicalUnitWeightG(packageCode) : null;
 
-    // 3) If API did not provide weight, scrape HTML (Mouser-first still)
-    if (!rawWeight && productUrl) {
-      const htmlResult = await scrapeUnitWeightFromMouserPage(productUrl);
-      if (htmlResult?.rawWeight) {
-        rawWeight = htmlResult.rawWeight;
-        scrapedFromHtml = htmlResult.rawWeight;
-      }
+    if (unitWeightG == null) {
+      return json(200, {
+        weight: null,
+        unitWeightLbs: null,
+        unitWeightG: null,
+        qty,
+        totalWeightLbs: null,
+        totalWeightG: null,
+        source: "Package Lookup (No Match)",
+        description,
+        manufacturer,
+        manufacturerPartNumber,
+        mouserPartNumber,
+        productUrl: first.ProductDetailUrl || null,
+        datasheetUrl: first.DataSheetUrl || null,
+        detectedPackage: packageCode,
+        error: "Could not infer package / no weight mapping",
+      });
     }
 
-    // 4) Parse weight into lbs
-    const { weightLbs, parsedFrom } = parseWeightToLbs(rawWeight);
+    const unitWeightLbs = gToLbs(unitWeightG);
+    const totalWeightG = unitWeightG * qty;
+    const totalWeightLbs = gToLbs(totalWeightG);
 
     return json(200, {
-      weight: weightLbs, // lbs
-      source: weightLbs ? (rawWeightFromApi ? "Mouser API" : "Mouser HTML") : "Mouser (No Weight)",
-      description: first.Description || null,
-      manufacturer: first.Manufacturer || null,
-      manufacturerPartNumber: first.ManufacturerPartNumber || part,
-      mouserPartNumber: first.MouserPartNumber || null,
-      productUrl,
+      weight: totalWeightLbs,          // backward compatible (total lbs)
+      unitWeightLbs,
+      unitWeightG,
+      qty,
+      totalWeightLbs,
+      totalWeightG,
+
+      source: "Package Lookup",
+      detectedPackage: packageCode,
+
+      description,
+      manufacturer,
+      manufacturerPartNumber,
+      mouserPartNumber,
+      productUrl: first.ProductDetailUrl || null,
       datasheetUrl: first.DataSheetUrl || null,
-      rawWeight: rawWeight || null,
-      scrapedFromHtml: scrapedFromHtml || null,
-      parsedFrom: parsedFrom || null,
-      error: weightLbs
-        ? null
-        : productUrl
-          ? "Weight not found (API + HTML scrape)"
-          : "Weight not found (API only)",
     });
   } catch (e) {
     return json(500, { error: e?.message || "Server error" });
@@ -112,84 +125,58 @@ function json(statusCode, obj) {
   };
 }
 
+function gToLbs(g) {
+  return g / 453.59237;
+}
+
 /**
- * Mouser pages often render specs in HTML tables, but sometimes they’re in
- * embedded JSON/script tags. We try multiple patterns.
+ * Detect common SMD size codes: 0402 0603 0805 1206 1210 1812 2010 2512 etc
+ * Works great for resistors/caps/inductors where size is in part number.
  */
-async function scrapeUnitWeightFromMouserPage(url) {
-  try {
-    // Ensure we fetch the same host Mouser redirects you to (www2 is common)
-    const resp = await fetch(url, {
-      method: "GET",
-      headers: {
-        // Some sites return different HTML without a UA
-        "User-Agent": "Mozilla/5.0 (compatible; NetlifyFunction/1.0)",
-        "Accept": "text/html,application/xhtml+xml",
-      },
-      redirect: "follow",
-    });
+function inferSmdPackage({ part, manufacturerPartNumber, mouserPartNumber, description }) {
+  const hay = [
+    part,
+    manufacturerPartNumber,
+    mouserPartNumber,
+    description,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toUpperCase();
 
-    const html = await resp.text().catch(() => "");
-    if (!html) return { rawWeight: null };
+  // Direct size codes in text
+  const m = hay.match(/\b(01005|0201|0402|0603|0805|1008|1206|1210|1806|1812|2010|2512)\b/);
+  if (m) return m[1];
 
-    // Normalize whitespace to make regex easier
-    const compact = html.replace(/\s+/g, " ");
+  // Sometimes Mouser PN looks like "71-CRCW0805-1.0K-E3" (already handled)
+  // Try to match "...0805..." even without word boundaries
+  const m2 = hay.match(/(01005|0201|0402|0603|0805|1008|1206|1210|1806|1812|2010|2512)/);
+  if (m2) return m2[1];
 
-    // ✅ Pattern A: Table row like:
-    // <td>Unit Weight:</td><td>5.500 mg</td>
-    let m =
-      compact.match(/Unit\s*Weight\s*:?<\/[^>]*>\s*<\/td>\s*<td[^>]*>\s*([0-9.,]+\s*(?:mg|g|kg|oz|lb|lbs))/i) ||
-      compact.match(/Unit\s*Weight\s*:?<\/td>\s*<td[^>]*>\s*([0-9.,]+\s*(?:mg|g|kg|oz|lb|lbs))/i);
-
-    if (m?.[1]) return { rawWeight: cleanWeight(m[1]) };
-
-    // ✅ Pattern B: Plain text somewhere:
-    // Unit Weight: 5.500 mg
-    m = compact.match(/Unit\s*Weight\s*:\s*([0-9.,]+\s*(?:mg|g|kg|oz|lb|lbs))/i);
-    if (m?.[1]) return { rawWeight: cleanWeight(m[1]) };
-
-    // ✅ Pattern C: Sometimes appears in JSON blobs / script text:
-    // "Unit Weight":"5.500 mg" or "unitWeight":"5.500 mg"
-    m =
-      compact.match(/"Unit\s*Weight"\s*:\s*"([^"]+?)"/i) ||
-      compact.match(/"unitWeight"\s*:\s*"([^"]+?)"/i) ||
-      compact.match(/unitWeight\\?":\\?"([^\\"]+?)\\?"/i);
-
-    if (m?.[1] && /(?:mg|g|kg|oz|lb|lbs)/i.test(m[1])) return { rawWeight: cleanWeight(m[1]) };
-
-    return { rawWeight: null };
-  } catch {
-    return { rawWeight: null };
-  }
+  return null;
 }
 
-function cleanWeight(s) {
-  // remove commas and trim
-  return String(s).replace(/,/g, "").trim();
-}
+/**
+ * Typical single-component weights (GRAMS).
+ * These are practical shipping weights (not perfect metrology).
+ * You can tune these numbers over time using your actual shipments.
+ */
+function typicalUnitWeightG(packageCode) {
+  const table = {
+    // Tiny passives
+    "01005": 0.0001,
+    "0201": 0.0002,
+    "0402": 0.0005,
+    "0603": 0.0010,
+    "0805": 0.0055,  // matches your screenshot example (5.500 mg)
+    "1008": 0.0100,
+    "1206": 0.0150,
+    "1210": 0.0200,
+    "1806": 0.0300,
+    "1812": 0.0400,
+    "2010": 0.0600,
+    "2512": 0.0900,
+  };
 
-// Accepts things like "0.009 g", "9 mg", "2 kg", "0.51 lb"
-function parseWeightToLbs(raw) {
-  if (!raw || typeof raw !== "string") return { weightLbs: null, parsedFrom: null };
-
-  const s = raw.trim();
-  const m = s.match(/([\d.]+)\s*(mg|g|kg|lb|lbs|oz)\b/i);
-  if (!m) return { weightLbs: null, parsedFrom: s };
-
-  const value = parseFloat(m[1]);
-  if (!isFinite(value)) return { weightLbs: null, parsedFrom: s };
-
-  const unit = (m[2] || "").toLowerCase();
-
-  let lbs = null;
-  if (unit === "mg") lbs = (value / 1000) / 453.59237; // mg → g → lb
-  else if (unit === "g") lbs = value / 453.59237;
-  else if (unit === "kg") lbs = (value * 1000) / 453.59237;
-  else if (unit === "oz") lbs = value / 16;
-  else if (unit === "lb" || unit === "lbs") lbs = value;
-
-  // round a bit for readability (keep good precision)
-  if (lbs !== null) lbs = Number(lbs.toFixed(10));
-
-  return { weightLbs: lbs, parsedFrom: s };
+  return table[packageCode] ?? null;
 }
