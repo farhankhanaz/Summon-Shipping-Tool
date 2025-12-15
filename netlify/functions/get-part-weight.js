@@ -1,31 +1,23 @@
 // netlify/functions/get-part-weight.js
-
-exports.handler = async (event) => {
+export async function handler(event) {
   try {
-    const partRaw = (event.queryStringParameters?.part || "").trim();
-    if (!partRaw) {
-      return json(400, { error: "Missing ?part=" });
+    const part = (event.queryStringParameters?.part || "").trim();
+    if (!part) {
+      return json(400, { error: "Missing ?part=..." });
     }
 
-    const part = partRaw.toUpperCase();
     const apiKey = process.env.MOUSER_API_KEY;
-
     if (!apiKey) {
-      return json(500, { error: "MOUSER_API_KEY is not set in Netlify env vars" });
+      return json(500, { error: "MOUSER_API_KEY not set in Netlify environment variables" });
     }
 
-    // 1) Try Mouser Search API (V2) via keyword search using the MPN as the keyword
-    // Docs show: POST /api/v2/search/keywordandmanufacturer?apiKey=...
-    const url = `https://api.mouser.com/api/v2/search/keywordandmanufacturer?apiKey=${encodeURIComponent(
-      apiKey
-    )}`;
+    // Mouser Part Number Search endpoint
+    const url = `https://api.mouser.com/api/v1/search/partnumber?apiKey=${encodeURIComponent(apiKey)}`;
 
     const body = {
-      SearchByKeywordMfrNameRequest: {
-        keyword: partRaw,      // keep original formatting for best match
-        records: 25,
-        pageNumber: 1,
-        searchOptions: "None",
+      SearchByPartRequest: {
+        mouserPartNumber: part,
+        partSearchOptions: "string", // Mouser expects a string here; this is the common safe value
       },
     };
 
@@ -35,72 +27,88 @@ exports.handler = async (event) => {
       body: JSON.stringify(body),
     });
 
-    const data = await resp.json();
+    const data = await resp.json().catch(() => ({}));
 
-    // Mouser returns: { SearchResults: { Parts: [...] }, Errors: [...] }
-    const errors = data?.Errors || [];
-    if (!resp.ok || errors.length) {
+    // If Mouser returns an error message, forward it
+    if (!resp.ok) {
+      return json(resp.status, {
+        error: "Mouser API request failed",
+        details: data,
+      });
+    }
+
+    const products =
+      data?.SearchResults?.Parts || data?.SearchResults?.Parts?.Parts || data?.SearchResults?.Parts || [];
+
+    const first = Array.isArray(products) ? products[0] : null;
+    if (!first) {
       return json(200, {
         weight: null,
         source: "Mouser API",
         description: null,
         productUrl: null,
         datasheetUrl: null,
-        error: errors[0]?.Message || `Mouser API error (HTTP ${resp.status})`,
+        error: "Not found on Mouser",
       });
     }
 
-    const parts = data?.SearchResults?.Parts || [];
-    if (!parts.length) {
-      return json(200, {
-        weight: null,
-        source: "Mouser API",
-        description: null,
-        productUrl: null,
-        datasheetUrl: null,
-        notFound: true,
-      });
-    }
+    // Mouser fields vary by category; try common keys
+    const rawWeight =
+      first.Weight ||
+      first?.ProductAttributes?.find?.((a) => /weight/i.test(a?.AttributeName || ""))?.AttributeValue ||
+      null;
 
-    // Prefer exact MPN match if available
-    const exact =
-      parts.find(
-        (p) => (p?.ManufacturerPartNumber || "").toUpperCase() === part
-      ) || parts[0];
-
-    const unitWeightKg = exact?.UnitWeightKg?.UnitWeight;
-
-    // Convert kg → lbs
-    const lbs =
-      typeof unitWeightKg === "number" && isFinite(unitWeightKg)
-        ? unitWeightKg * 2.2046226218
-        : null;
+    const { weightLbs, parsedFrom } = parseWeightToLbs(rawWeight);
 
     return json(200, {
-      weight: lbs, // lbs per unit
+      weight: weightLbs,                // lbs
       source: "Mouser API",
-      description: exact?.Description || null,
-      manufacturer: exact?.Manufacturer || null,
-      manufacturerPartNumber: exact?.ManufacturerPartNumber || null,
-      mouserPartNumber: exact?.MouserPartNumber || null,
-      unitWeightKg: typeof unitWeightKg === "number" ? unitWeightKg : null,
-      productUrl: exact?.ProductDetailUrl || null,
-      datasheetUrl: exact?.DataSheetUrl || null,
+      description: first.Description || first.ManufacturerPartNumber || null,
+      productUrl: first.ProductDetailUrl || first?.ProductDetailUrl || null,
+      datasheetUrl: first.DataSheetUrl || first?.DataSheetUrl || null,
+      rawWeight: rawWeight || null,     // keep for debugging
+      parsedFrom,
     });
   } catch (e) {
-    return json(500, { error: e?.message || String(e) });
+    return json(500, { error: e?.message || "Server error" });
   }
-};
+}
 
 function json(statusCode, obj) {
   return {
     statusCode,
     headers: {
       "Content-Type": "application/json",
-      // allow browser calls from your site
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Headers": "Content-Type",
     },
     body: JSON.stringify(obj),
   };
+}
+
+// Accepts things like "0.009 g", "9 mg", "2 kg", "0.51 lb"
+function parseWeightToLbs(raw) {
+  if (!raw || typeof raw !== "string") return { weightLbs: null, parsedFrom: null };
+
+  const s = raw.trim();
+  const m = s.match(/([\d.]+)\s*(mg|g|kg|lb|lbs|oz)?/i);
+  if (!m) return { weightLbs: null, parsedFrom: s };
+
+  const value = parseFloat(m[1]);
+  if (!isFinite(value)) return { weightLbs: null, parsedFrom: s };
+
+  const unit = (m[2] || "").toLowerCase();
+
+  let lbs = null;
+  if (unit === "mg") lbs = value / 1000 / 453.59237;
+  else if (unit === "g") lbs = value / 453.59237;
+  else if (unit === "kg") lbs = value * 1000 / 453.59237;
+  else if (unit === "oz") lbs = value / 16;
+  else if (unit === "lb" || unit === "lbs") lbs = value;
+  else {
+    // If unit missing, don’t guess
+    lbs = null;
+  }
+
+  return { weightLbs: lbs, parsedFrom: s };
 }
