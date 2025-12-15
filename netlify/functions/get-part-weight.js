@@ -6,9 +6,9 @@ export async function handler(event) {
     if (!part) return json(400, { error: "Missing ?part=..." });
 
     const apiKey = process.env.MOUSER_API_KEY;
-    if (!apiKey) return json(500, { error: "MOUSER_API_KEY not set" });
+    if (!apiKey) return json(500, { error: "MOUSER_API_KEY not set in Netlify environment variables" });
 
-    // 1) Mouser API search
+    // 1) Mouser API search (part number endpoint)
     const apiUrl = `https://api.mouser.com/api/v1/search/partnumber?apiKey=${encodeURIComponent(apiKey)}`;
 
     const apiResp = await fetch(apiUrl, {
@@ -23,133 +23,173 @@ export async function handler(event) {
     });
 
     const apiData = await apiResp.json().catch(() => ({}));
-    const partInfo = apiData?.SearchResults?.Parts?.[0];
-
-    if (!partInfo) {
-      return json(200, { error: "Not found on Mouser", details: apiData });
+    if (!apiResp.ok) {
+      return json(apiResp.status, { error: "Mouser API request failed", details: apiData });
     }
 
-    // Prefer Mouser ProductDetailUrl, but normalize to www2 (often the actual canonical host)
-    let productUrl = partInfo.ProductDetailUrl || null;
-    if (productUrl) {
-      productUrl = productUrl.replace("https://www.mouser.com/", "https://www2.mouser.com/");
-    }
+    // Mouser response can vary; these cover common shapes
+    const products =
+      apiData?.SearchResults?.Parts ||
+      apiData?.SearchResults?.Parts?.Parts ||
+      apiData?.SearchResults?.Parts?.Part ||
+      [];
 
-    let rawWeight = null;
-    let scrapedFromHtml = null;
-    let htmlStatus = null;
-    let htmlFinalUrl = null;
+    const first = Array.isArray(products) ? products[0] : null;
 
-    // 2) HTML scrape
-    if (productUrl) {
-      const htmlResp = await fetch(productUrl, {
-        redirect: "follow",
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-          "Accept":
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.9",
-          "Cache-Control": "no-cache",
-          "Pragma": "no-cache",
-        },
+    if (!first) {
+      return json(200, {
+        weight: null,
+        source: "Mouser API",
+        description: null,
+        manufacturer: null,
+        manufacturerPartNumber: part,
+        mouserPartNumber: null,
+        productUrl: null,
+        datasheetUrl: null,
+        rawWeight: null,
+        scrapedFromHtml: null,
+        parsedFrom: null,
+        error: "Not found on Mouser",
       });
+    }
 
-      htmlStatus = htmlResp.status;
-      htmlFinalUrl = htmlResp.url;
+    const productUrl = first.ProductDetailUrl || null;
 
-      const html = await htmlResp.text();
+    // 2) Try to read weight from API fields / attributes
+    const rawWeightFromApi =
+      first.Weight ||
+      first.UnitWeight ||
+      first?.ProductAttributes?.find?.((a) => /unit\s*weight|weight/i.test(a?.AttributeName || ""))?.AttributeValue ||
+      null;
 
-      // If Mouser blocks (403/503), you'll usually see "Access Denied" in HTML
-      if (htmlResp.ok) {
-        rawWeight = extractUnitWeight(html);
-        if (rawWeight) scrapedFromHtml = htmlFinalUrl || productUrl;
+    let rawWeight = rawWeightFromApi;
+    let scrapedFromHtml = null;
+
+    // 3) If API did not provide weight, scrape HTML (Mouser-first still)
+    if (!rawWeight && productUrl) {
+      const htmlResult = await scrapeUnitWeightFromMouserPage(productUrl);
+      if (htmlResult?.rawWeight) {
+        rawWeight = htmlResult.rawWeight;
+        scrapedFromHtml = htmlResult.rawWeight;
       }
     }
 
+    // 4) Parse weight into lbs
     const { weightLbs, parsedFrom } = parseWeightToLbs(rawWeight);
 
     return json(200, {
       weight: weightLbs, // lbs
-      source: rawWeight ? "Mouser HTML" : "Mouser (No Weight)",
-      description: partInfo.Description || null,
-      manufacturer: partInfo.Manufacturer || null,
-      manufacturerPartNumber: partInfo.ManufacturerPartNumber || null,
-      mouserPartNumber: partInfo.MouserPartNumber || null,
+      source: weightLbs ? (rawWeightFromApi ? "Mouser API" : "Mouser HTML") : "Mouser (No Weight)",
+      description: first.Description || null,
+      manufacturer: first.Manufacturer || null,
+      manufacturerPartNumber: first.ManufacturerPartNumber || part,
+      mouserPartNumber: first.MouserPartNumber || null,
       productUrl,
-      datasheetUrl: partInfo.DataSheetUrl || null,
-
+      datasheetUrl: first.DataSheetUrl || null,
       rawWeight: rawWeight || null,
       scrapedFromHtml: scrapedFromHtml || null,
       parsedFrom: parsedFrom || null,
-
-      // Debug (helps us confirm scrape isn't blocked)
-      htmlStatus,
-      htmlFinalUrl,
-
-      error: rawWeight ? null : "Weight not found (API + HTML scrape)",
+      error: weightLbs
+        ? null
+        : productUrl
+          ? "Weight not found (API + HTML scrape)"
+          : "Weight not found (API only)",
     });
-  } catch (err) {
-    return json(500, { error: err?.message || "Server error" });
+  } catch (e) {
+    return json(500, { error: e?.message || "Server error" });
   }
 }
 
-function json(statusCode, body) {
+function json(statusCode, obj) {
   return {
     statusCode,
     headers: {
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type",
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(obj),
   };
 }
 
 /**
- * Mouser HTML varies. This searches for a table row containing "Unit Weight"
- * and grabs the next cell's text value.
+ * Mouser pages often render specs in HTML tables, but sometimes they’re in
+ * embedded JSON/script tags. We try multiple patterns.
  */
-function extractUnitWeight(html) {
-  if (!html || typeof html !== "string") return null;
+async function scrapeUnitWeightFromMouserPage(url) {
+  try {
+    // Ensure we fetch the same host Mouser redirects you to (www2 is common)
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        // Some sites return different HTML without a UA
+        "User-Agent": "Mozilla/5.0 (compatible; NetlifyFunction/1.0)",
+        "Accept": "text/html,application/xhtml+xml",
+      },
+      redirect: "follow",
+    });
 
-  // Pattern A: <td>Unit Weight:</td> <td>5.500 mg</td>
-  let m = html.match(
-    /<td[^>]*>\s*Unit\s*Weight\s*:?\s*<\/td>\s*<td[^>]*>\s*([^<]+?)\s*<\/td>/i
-  );
-  if (m?.[1]) return cleanup(m[1]);
+    const html = await resp.text().catch(() => "");
+    if (!html) return { rawWeight: null };
 
-  // Pattern B: Sometimes "Unit Weight" is wrapped inside spans, strong, etc.
-  m = html.match(
-    /Unit\s*Weight\s*:?(?:\s*<\/[^>]+>)*\s*<\/td>\s*<td[^>]*>\s*([^<]+?)\s*<\/td>/i
-  );
-  if (m?.[1]) return cleanup(m[1]);
+    // Normalize whitespace to make regex easier
+    const compact = html.replace(/\s+/g, " ");
 
-  // Pattern C: Fallback: find "Unit Weight" then look ahead for something like "5.500 mg"
-  m = html.match(/Unit\s*Weight[\s\S]{0,300}?([\d.]+\s*(mg|g|kg|oz|lb|lbs))/i);
-  if (m?.[1]) return cleanup(m[1]);
+    // ✅ Pattern A: Table row like:
+    // <td>Unit Weight:</td><td>5.500 mg</td>
+    let m =
+      compact.match(/Unit\s*Weight\s*:?<\/[^>]*>\s*<\/td>\s*<td[^>]*>\s*([0-9.,]+\s*(?:mg|g|kg|oz|lb|lbs))/i) ||
+      compact.match(/Unit\s*Weight\s*:?<\/td>\s*<td[^>]*>\s*([0-9.,]+\s*(?:mg|g|kg|oz|lb|lbs))/i);
 
-  return null;
+    if (m?.[1]) return { rawWeight: cleanWeight(m[1]) };
 
-  function cleanup(s) {
-    return String(s).replace(/&nbsp;/g, " ").trim();
+    // ✅ Pattern B: Plain text somewhere:
+    // Unit Weight: 5.500 mg
+    m = compact.match(/Unit\s*Weight\s*:\s*([0-9.,]+\s*(?:mg|g|kg|oz|lb|lbs))/i);
+    if (m?.[1]) return { rawWeight: cleanWeight(m[1]) };
+
+    // ✅ Pattern C: Sometimes appears in JSON blobs / script text:
+    // "Unit Weight":"5.500 mg" or "unitWeight":"5.500 mg"
+    m =
+      compact.match(/"Unit\s*Weight"\s*:\s*"([^"]+?)"/i) ||
+      compact.match(/"unitWeight"\s*:\s*"([^"]+?)"/i) ||
+      compact.match(/unitWeight\\?":\\?"([^\\"]+?)\\?"/i);
+
+    if (m?.[1] && /(?:mg|g|kg|oz|lb|lbs)/i.test(m[1])) return { rawWeight: cleanWeight(m[1]) };
+
+    return { rawWeight: null };
+  } catch {
+    return { rawWeight: null };
   }
 }
 
-function parseWeightToLbs(raw) {
-  if (!raw) return { weightLbs: null, parsedFrom: null };
+function cleanWeight(s) {
+  // remove commas and trim
+  return String(s).replace(/,/g, "").trim();
+}
 
-  const m = String(raw).match(/([\d.]+)\s*(mg|g|kg|oz|lb|lbs)/i);
-  if (!m) return { weightLbs: null, parsedFrom: raw };
+// Accepts things like "0.009 g", "9 mg", "2 kg", "0.51 lb"
+function parseWeightToLbs(raw) {
+  if (!raw || typeof raw !== "string") return { weightLbs: null, parsedFrom: null };
+
+  const s = raw.trim();
+  const m = s.match(/([\d.]+)\s*(mg|g|kg|lb|lbs|oz)\b/i);
+  if (!m) return { weightLbs: null, parsedFrom: s };
 
   const value = parseFloat(m[1]);
-  const unit = m[2].toLowerCase();
+  if (!isFinite(value)) return { weightLbs: null, parsedFrom: s };
+
+  const unit = (m[2] || "").toLowerCase();
 
   let lbs = null;
-  if (unit === "mg") lbs = value / 1000 / 453.59237;
+  if (unit === "mg") lbs = (value / 1000) / 453.59237; // mg → g → lb
   else if (unit === "g") lbs = value / 453.59237;
   else if (unit === "kg") lbs = (value * 1000) / 453.59237;
   else if (unit === "oz") lbs = value / 16;
   else if (unit === "lb" || unit === "lbs") lbs = value;
 
-  return { weightLbs: lbs, parsedFrom: raw };
+  // round a bit for readability (keep good precision)
+  if (lbs !== null) lbs = Number(lbs.toFixed(10));
+
+  return { weightLbs: lbs, parsedFrom: s };
 }
