@@ -1,14 +1,18 @@
 // netlify/functions/get-part-weight.js
+
 export async function handler(event) {
   try {
     const part = (event.queryStringParameters?.part || "").trim();
-    if (!part) return json(400, { error: "Missing ?part=..." });
+    if (!part) {
+      return json(400, { error: "Missing ?part=..." });
+    }
 
     const apiKey = process.env.MOUSER_API_KEY;
     if (!apiKey) {
       return json(500, { error: "MOUSER_API_KEY not set in Netlify environment variables" });
     }
 
+    // 1) Mouser Part Number Search endpoint
     const url = `https://api.mouser.com/api/v1/search/partnumber?apiKey=${encodeURIComponent(apiKey)}`;
 
     const body = {
@@ -33,7 +37,6 @@ export async function handler(event) {
       });
     }
 
-    // Mouser typically returns: data.SearchResults.Parts (array)
     const parts = normalizeParts(data);
 
     const first = Array.isArray(parts) ? parts[0] : null;
@@ -45,27 +48,40 @@ export async function handler(event) {
         productUrl: null,
         datasheetUrl: null,
         rawWeight: null,
+        scrapedFromHtml: null,
         parsedFrom: null,
         error: "Not found on Mouser",
       });
     }
 
-    const productUrl = first.ProductDetailUrl || first?.ProductDetailUrl || null;
-    const datasheetUrl = first.DataSheetUrl || first?.DataSheetUrl || null;
+    const productUrl = first?.ProductDetailUrl || null;
+    const datasheetUrl = first?.DataSheetUrl || null;
 
-    // Try all likely places where weight might appear
-    const { rawWeight, parsedFrom } = extractRawWeight(first);
+    // 2) Try weight from Mouser API fields / attributes (rare)
+    let rawWeight = extractWeightFromApi(first);
+
+    // 3) If not in API, scrape Mouser product page HTML for "Unit Weight"
+    let scrapedFromHtml = null;
+    if (!rawWeight && productUrl) {
+      scrapedFromHtml = await scrapeMouserUnitWeight(productUrl);
+      rawWeight = scrapedFromHtml || null;
+    }
+
     const { weightLbs } = parseWeightToLbs(rawWeight);
 
     return json(200, {
       weight: weightLbs, // lbs (number) or null
-      source: "Mouser API",
+      source: rawWeight ? (scrapedFromHtml ? "Mouser (HTML Unit Weight)" : "Mouser API") : "Mouser (No Weight)",
       description: first.Description || first.ManufacturerPartNumber || null,
+      manufacturer: first.Manufacturer || null,
+      manufacturerPartNumber: first.ManufacturerPartNumber || null,
+      mouserPartNumber: first.MouserPartNumber || null,
       productUrl,
       datasheetUrl,
-      rawWeight: rawWeight ?? null,
-      parsedFrom: parsedFrom ?? null,
-      error: weightLbs == null ? "Weight not provided by Mouser for this listing" : null,
+      rawWeight: rawWeight || null,
+      scrapedFromHtml: scrapedFromHtml || null, // TEMP DEBUG (we remove later)
+      parsedFrom: rawWeight ? (scrapedFromHtml ? "HTML:Unit Weight" : "API") : null,
+      error: weightLbs == null ? "Weight not found (API + HTML scrape)" : null,
     });
   } catch (e) {
     return json(500, { error: e?.message || "Server error" });
@@ -84,40 +100,28 @@ function json(statusCode, obj) {
   };
 }
 
-// --- Helpers ---
-
+// --- Normalize Mouser parts list ---
 function normalizeParts(data) {
-  // Most common:
-  // data.SearchResults.Parts => array
-  const partsA = data?.SearchResults?.Parts;
-  if (Array.isArray(partsA)) return partsA;
+  const a = data?.SearchResults?.Parts;
+  if (Array.isArray(a)) return a;
 
-  // Sometimes APIs wrap in another object:
-  // data.SearchResults?.Parts?.Parts => array
-  const partsB = data?.SearchResults?.Parts?.Parts;
-  if (Array.isArray(partsB)) return partsB;
+  const b = data?.SearchResults?.Parts?.Parts;
+  if (Array.isArray(b)) return b;
 
-  // Fallback
   return [];
 }
 
-function extractRawWeight(product) {
-  // 1) direct fields that sometimes exist
-  const directCandidates = [
-    ["UnitWeight", product?.UnitWeight],
-    ["Weight", product?.Weight],
-    ["NetWeight", product?.NetWeight],
-    ["PackageWeight", product?.PackageWeight],
-  ];
+// --- Extract weight from API response fields (rare) ---
+function extractWeightFromApi(first) {
+  // direct fields (rare)
+  const direct =
+    (typeof first?.Weight === "string" && first.Weight.trim()) ? first.Weight.trim() : null;
 
-  for (const [from, val] of directCandidates) {
-    if (typeof val === "string" && val.trim()) return { rawWeight: val.trim(), parsedFrom: from };
-  }
+  if (direct) return direct;
 
-  // 2) ProductAttributes (shape can vary)
-  const attrs = normalizeAttributes(product?.ProductAttributes);
+  // ProductAttributes (common place for specs, but often weight is missing)
+  const attrs = normalizeAttributes(first?.ProductAttributes);
 
-  // Priority order: names that usually mean physical weight
   const priority = [
     /unit\s*weight/i,
     /net\s*weight/i,
@@ -128,38 +132,70 @@ function extractRawWeight(product) {
 
   for (const rx of priority) {
     const hit = attrs.find((a) => rx.test(a?.AttributeName || "") && (a?.AttributeValue || "").trim());
-    if (hit) {
-      return {
-        rawWeight: (hit.AttributeValue || "").trim(),
-        parsedFrom: `ProductAttributes:${hit.AttributeName}`,
-      };
-    }
+    if (hit) return String(hit.AttributeValue).trim();
   }
 
-  return { rawWeight: null, parsedFrom: null };
+  return null;
 }
 
 function normalizeAttributes(productAttributes) {
-  // Mouser sometimes returns:
-  // ProductAttributes: [ {AttributeName, AttributeValue}, ... ]
   if (Array.isArray(productAttributes)) return productAttributes;
 
-  // Or:
-  // ProductAttributes: { ProductAttribute: [ ... ] }
   const maybe = productAttributes?.ProductAttribute;
   if (Array.isArray(maybe)) return maybe;
 
   return [];
 }
 
-// Accepts: "0.009 g", "9 mg", "2 kg", "0.51 lb", "603.808 mg", etc.
+// --- Scrape Mouser product HTML for Unit Weight ---
+async function scrapeMouserUnitWeight(productUrl) {
+  try {
+    const resp = await fetch(productUrl, {
+      headers: {
+        // Helps reduce bot-blocking
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
+
+    if (!resp.ok) return null;
+
+    const html = await resp.text();
+
+    // Try several patterns (Mouser HTML changes often)
+    const patterns = [
+      // Pattern A: capture number+unit near "Unit Weight"
+      /Unit\s*Weight[^A-Za-z0-9]{0,50}([\d.,]+\s*(mg|g|kg|lb|lbs|oz))/i,
+
+      // Pattern B: sometimes "Unit Weight" appears in table-like HTML
+      /Unit\s*Weight<\/[^>]*>\s*<[^>]*>\s*([^<]{1,40})</i,
+
+      // Pattern C: Net Weight
+      /Net\s*Weight[^A-Za-z0-9]{0,50}([\d.,]+\s*(mg|g|kg|lb|lbs|oz))/i,
+    ];
+
+    for (const re of patterns) {
+      const m = html.match(re);
+      if (m && m[1]) {
+        return m[1].replace(/,/g, "").trim(); // remove commas in numbers
+      }
+    }
+
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// --- Convert text like "603.808 mg" / "0.009 g" / "0.06 oz" -> lbs ---
 function parseWeightToLbs(raw) {
   if (!raw || typeof raw !== "string") return { weightLbs: null };
 
-  // remove commas and extra text like "approx." if present
   const s = raw.replace(/,/g, "").trim();
 
-  // capture first number + unit
+  // Require a unit so we don't guess wrong
   const m = s.match(/([\d.]+)\s*(mg|g|kg|lb|lbs|oz)\b/i);
   if (!m) return { weightLbs: null };
 
